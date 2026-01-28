@@ -805,7 +805,10 @@ if st.sidebar.button("🚀 Run Backtest", type="primary", use_container_width=Tr
             xaxis_title='Date',
             yaxis_title='Label (0=Down, 1=Up)',
             height=400,
-            hovermode='x unified'
+            hovermode='x unified',
+            xaxis=dict(
+                range=['2022-02-01', '2023-01-31']
+            )
         )
         st.plotly_chart(fig_labels, use_container_width=True)
         
