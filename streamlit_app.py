@@ -28,6 +28,8 @@ from pathlib import Path
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import pickle
+import re
 
 
 # Set page config
@@ -219,23 +221,166 @@ def normalize_features(df, features, window=252):
     return df
 
 
-def make_pipeline():
-    """Create XGBoost classification pipeline."""
-    pipe = Pipeline([
-        ("model", XGBClassifier(
-            n_estimators=400,
-            max_depth=5,
-            learning_rate=0.03,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            eval_metric="auc",
-            random_state=42,
-            n_jobs=-1,
-            verbosity=0
-        ))
-    ])
+def get_available_models(category):
+    """Get all available pre-trained models for a category.
+    
+    Args:
+        category: Category name (e.g., 'Technology' or 'Technology_stocks_data')
+    
+    Returns:
+        Dictionary mapping test date ranges to model paths
+    """
+    # Remove '_stocks_data' suffix if present
+    category_clean = category.replace('_stocks_data', '').replace(' ', '_')
+    models_dir = Path(f"./models/{category_clean}")
+    
+    if not models_dir.exists():
+        return {}
+    
+    models = {}
+    
+    # Pattern: model_train_YYYYMMDD_to_YYYYMMDD_test_YYYYMMDD_to_YYYYMMDD.pkl
+    pattern = r'model_train_(\d{8})_to_(\d{8})_test_(\d{8})_to_(\d{8})\.pkl'
+    
+    for model_file in models_dir.glob('*.pkl'):
+        match = re.match(pattern, model_file.name)
+        if match:
+            train_start = pd.to_datetime(match.group(1), format='%Y%m%d')
+            train_end = pd.to_datetime(match.group(2), format='%Y%m%d')
+            test_start = pd.to_datetime(match.group(3), format='%Y%m%d')
+            test_end = pd.to_datetime(match.group(4), format='%Y%m%d')
+            
+            # Use test date range as key
+            models[(test_start, test_end)] = {
+                'path': model_file,
+                'train_start': train_start,
+                'train_end': train_end,
+                'test_start': test_start,
+                'test_end': test_end
+            }
+    
+    return models
 
-    return pipe
+
+def find_matching_model(available_models, test_start, test_end):
+    """Find the best matching model for a given test period.
+    
+    Args:
+        available_models: Dictionary of available models
+        test_start: Test start date
+        test_end: Test end date
+    
+    Returns:
+        Model info dictionary or None
+    """
+    # First try exact match
+    for (model_test_start, model_test_end), model_info in available_models.items():
+        if model_test_start == test_start and model_test_end == test_end:
+            return model_info
+    
+    # If no exact match, find model with overlapping test period
+    best_match = None
+    best_overlap = 0
+    
+    for (model_test_start, model_test_end), model_info in available_models.items():
+        # Calculate overlap
+        overlap_start = max(model_test_start, test_start)
+        overlap_end = min(model_test_end, test_end)
+        
+        if overlap_start <= overlap_end:
+            overlap_days = (overlap_end - overlap_start).days
+            if overlap_days > best_overlap:
+                best_overlap = overlap_days
+                best_match = model_info
+    
+    return best_match
+
+
+def evaluate_with_models(data_splits, category):
+    """
+    Evaluate using pre-trained models for each data split.
+    
+    Args:
+        data_splits: List of data split dictionaries from train_test_split
+        category: Category name for loading the correct models
+    
+    Returns:
+        Tuple of (results_list, all_y_test, all_y_pred, predictions_df)
+    """
+    results = []
+    all_y_test = []
+    all_y_pred = []
+    predictions_list = []
+    
+    # Load all available models for this category
+    available_models = get_available_models(category)
+    
+    if not available_models:
+        st.error(f"No pre-trained models found for category: {category}")
+        return results, np.array(all_y_test), np.array(all_y_pred), pd.DataFrame()
+    
+    st.info(f"Found {len(available_models)} pre-trained models for {category}")
+    
+    for split_data in data_splits:
+        train_start = split_data['train_start']
+        train_end = split_data['train_end']
+        test_start = split_data['test_start']
+        test_end = split_data['test_end']
+        X_test = split_data['X_test']
+        y_test = split_data['y_test']
+        test = split_data['test']
+        target = split_data['target']
+        
+        # Find matching pre-trained model
+        model_info = find_matching_model(available_models, test_start, test_end)
+        
+        if model_info is None:
+            st.warning(f"No matching model found for period {test_start.strftime('%Y-%m-%d')} to {test_end.strftime('%Y-%m-%d')}. Skipping...")
+            continue
+        
+        # Load the model
+        with open(model_info['path'], 'rb') as f:
+            model = pickle.load(f)['model']
+        
+        # Predict
+        y_prob = model.predict_proba(X_test)[:, 1]
+        y_pred = (y_prob > 0.5).astype(int)
+        
+        # Evaluate
+        auc = roc_auc_score(y_test, y_prob)
+        acc = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        ll = log_loss(y_test, y_prob)
+        
+        results.append({
+            "train_start": train_start,
+            "train_end": train_end,
+            "test_start": test_start,
+            "test_end": test_end,
+            "auc": auc,
+            "accuracy": acc,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "log_loss": ll,
+            "n_train": len(split_data['X_train']),
+            "n_test": len(X_test)
+        })
+        
+        # Store predictions for confusion matrix
+        all_y_test.extend(y_test.values)
+        all_y_pred.extend(y_pred)
+        
+        # Store detailed predictions with metadata
+        test_with_pred = test[[target, 'Date', 'Stock_symbol']].copy()
+        test_with_pred['y_pred'] = y_pred
+        test_with_pred['y_test'] = y_test.values
+        predictions_list.append(test_with_pred)
+    
+    predictions_df = pd.concat(predictions_list, ignore_index=True) if predictions_list else pd.DataFrame()
+    return results, np.array(all_y_test), np.array(all_y_pred), predictions_df
 
 
 def train_test_split(df, features_list, target, train_days=252, test_days=21):
@@ -250,12 +395,9 @@ def train_test_split(df, features_list, target, train_days=252, test_days=21):
         test_days: Number of days for test window (~1 month)
     
     Returns:
-        Tuple of (List of results dictionaries, all_y_test, all_y_pred, predictions_df)
+        List of dictionaries with train/test data splits
     """
     results = []
-    all_y_test = []
-    all_y_pred = []
-    predictions_list = []
     
     df["Date"] = pd.to_datetime(df["Date"])
     dates = df["Date"].sort_values().unique()
@@ -288,49 +430,29 @@ def train_test_split(df, features_list, target, train_days=252, test_days=21):
         X_test  = test[features_list]
         y_test  = test[target]
 
-        # Train model
-        pipe = make_pipeline()
-        pipe.fit(X_train, y_train)
-
-        # Predict
-        y_prob = pipe.predict_proba(X_test)[:, 1]
-        y_pred = (y_prob > 0.5).astype(int)
-
-        # Evaluate
-        auc  = roc_auc_score(y_test, y_prob)
-        acc  = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred, zero_division=0)
-        recall = recall_score(y_test, y_pred, zero_division=0)
-        f1 = f1_score(y_test, y_pred, zero_division=0)
-        ll = log_loss(y_test, y_prob)
-
-        results.append({
-            "train_start": train_start,
-            "train_end": train_end,
-            "test_start": test_start,
-            "test_end": test_end,
-            "auc": auc,
-            "accuracy": acc,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "log_loss": ll,
-            "n_train": len(train),
-            "n_test": len(test)
-        })
+        # Use pre-trained model or train new one if not found
+        # Note: load_pretrained_model will be called from the main function
+        # For now, we'll store the data and return it
+        # The calling function will handle model loading
         
-        # Store predictions for confusion matrix
-        all_y_test.extend(y_test.values)
-        all_y_pred.extend(y_pred)
+        result_data = {
+            'train_start': train_start,
+            'train_end': train_end,
+            'test_start': test_start,
+            'test_end': test_end,
+            'X_train': X_train,
+            'y_train': y_train,
+            'X_test': X_test,
+            'y_test': y_test,
+            'test': test,
+            'target': target
+        }
         
-        # Store detailed predictions with metadata
-        test_with_pred = test[[target, 'Date', 'Stock_symbol']].copy()
-        test_with_pred['y_pred'] = y_pred
-        test_with_pred['y_test'] = y_test.values
-        predictions_list.append(test_with_pred)
+        results.append(result_data)
+    
+    return results
 
-    predictions_df = pd.concat(predictions_list, ignore_index=True)
-    return results, np.array(all_y_test), np.array(all_y_pred), predictions_df
+
 
 
 # Sidebar configuration
@@ -349,7 +471,7 @@ if not csv_files_dict:
 selected_category = st.sidebar.selectbox(
     "Select Stock Category",
     options=list(csv_files_dict.keys()),
-    index=0
+    index=10
 )
 
 # Display selected file info
@@ -421,12 +543,23 @@ if st.sidebar.button("🚀 Run Backtest", type="primary", use_container_width=Tr
                 log_messages.append(f"✅ Total samples for modeling: {len(df_model)}")
                 log_box.text_area("Log Output", value="\n".join(log_messages), height=200, disabled=True)
                 
-                # Model training and evaluation
-                log_messages.append("\n🤖 Training models with rolling window validation...")
+                # Model evaluation with pre-trained models
+                log_messages.append("\n🤖 Preparing data splits...")
                 log_box.text_area("Log Output", value="\n".join(log_messages), height=200, disabled=True)
                 
-                results, all_y_test, all_y_pred, predictions_df = train_test_split(df_model, final_features, "Label", 
+                data_splits = train_test_split(df_model, final_features, "Label", 
                                           train_days=252, test_days=21)
+                
+                log_messages.append(f"✅ Created {len(data_splits)} data splits")
+                log_messages.append("\n📦 Loading pre-trained models and evaluating...")
+                log_box.text_area("Log Output", value="\n".join(log_messages), height=200, disabled=True)
+                
+                results, all_y_test, all_y_pred, predictions_df = evaluate_with_models(data_splits, selected_category)
+                
+                # Check if any results were generated
+                if not results:
+                    st.error("❌ No pre-trained models found for this category. Please ensure models are available in the ./models directory.")
+                    st.stop()
                 
                 for i, result in enumerate(results, 1):
                     log_messages.append(
