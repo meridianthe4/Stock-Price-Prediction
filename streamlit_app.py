@@ -468,10 +468,15 @@ if not csv_files_dict:
     st.stop()
 
 # Dropdown for file selection
+# Find index of Technology_stocks_data if it exists, otherwise use 0
+default_index = 0
+if 'Technology_stocks_data' in csv_files_dict:
+    default_index = list(csv_files_dict.keys()).index('Technology_stocks_data')
+
 selected_category = st.sidebar.selectbox(
     "Select Stock Category",
     options=list(csv_files_dict.keys()),
-    index=10
+    index=default_index
 )
 
 # Display selected file info
